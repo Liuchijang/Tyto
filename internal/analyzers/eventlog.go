@@ -221,6 +221,16 @@ public static class FirEvtx
                                 Field(sb, Num(rec.ThreadId), false);
                                 Field(sb, rec.MachineName, false);
                                 Field(sb, rec.UserId != null ? rec.UserId.ToString() : null, false);
+                                // Message, deliberately empty on every row. It would
+                                // come from rec.FormatDescription(), which is the same
+                                // per-event message-table lookup LevelDisplayName is
+                                // refused for above — and worse for evidence: it
+                                // resolves against the providers installed on the
+                                // machine doing the parsing, so an offline analysis
+                                // would render different text from a live one for the
+                                // identical event. The column stays so the CSV's shape
+                                // does not depend on the decision; what the event says
+                                // is in the .evtx the run still holds.
                                 Field(sb, "", true);
                                 w.WriteLine(sb.ToString());
                                 rows++;
