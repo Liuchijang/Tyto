@@ -15,9 +15,10 @@
 // of a collected Prefetch directory worth anything.
 //
 // Versions 17 (XP/2003), 23 (Vista/7), 26 (8.1), 30 (10) and 31 (11) are supported.
-// **Only version 30 has been verified against real artifacts** — 250 files from a
-// Windows 10 host — because that is the only version available to test against. The
-// others are implemented from the published layouts and covered by synthetic
+// **Versions 30 and 31 have been verified against real artifacts** — 241 files from a
+// Windows 10 host, all variant 2, and 441 from a Windows 11 host with the record's
+// hash matching the file name 441 times out of 441. Versions 17, 23 and 26 are
+// implemented from the published layout tables and covered only by synthetic
 // fixtures, which is a weaker guarantee and is why every layout is *validated* at
 // parse time rather than trusted: see chooseLayout.
 package prefetch
@@ -35,7 +36,7 @@ import (
 type File struct {
 	Version    uint32
 	Compressed bool
-	// LayoutName is the variant that validated, e.g. "30" or "30v2". Recorded
+	// LayoutName is the variant that validated, e.g. "30v1" or "30v2". Recorded
 	// because version 30 has two field layouts in the wild and an analyst comparing
 	// output against another tool needs to know which one was read.
 	LayoutName string
@@ -75,6 +76,11 @@ type Volume struct {
 // version and are read directly; only the timestamps and the run count shift.
 type layout struct {
 	name string
+	// infoSize is the published size of the file information block. It is not
+	// decoration: dword 0 of the block is the file metrics array offset, which the
+	// format fixes per shape, so headerSize+infoSize is a value the record itself
+	// states and chooseLayout selects on.
+	infoSize int
 	// lastRunOffset is relative to the start of the file information block.
 	lastRunOffset  int
 	lastRunSlots   int
@@ -82,33 +88,41 @@ type layout struct {
 	volumeStride   int
 }
 
-// layouts lists the candidates per version, **ordered by ascending lastRunOffset**.
+// layouts lists the candidates per version, transcribed from libyal's `Windows
+// Prefetch File (PF) format` v0.0.24 and written in **decimal, as that document's
+// tables are** — every wrong offset this table used to carry was a hex conversion of
+// a decimal table, so the conversion is not done by hand any more.
 //
-// Versions 30 and 31 have two entries because both shapes exist in the wild and the
-// version number does not distinguish them: the Windows 10 host this was developed
-// against keeps its timestamps eight bytes further in than the published
-// version-26-style layout, with the run count in the same place.
+// Version 30 has two entries because both shapes exist in the wild and the version
+// number does not distinguish them. What does distinguish them is the block size, 220
+// against 212: the run-time array is at 44 in both and only the run count moves, so
+// there is nothing in the *data* that reliably separates them. Measured over 682 real
+// v30 and v31 records, the dword at 124 reads as a plausible run count in 143 of them
+// — a fifth of a real run would get a wrong RunCount from a candidate chosen by
+// validation alone, which is why size selection comes first (see chooseLayout).
 //
-// The order is load-bearing. Trying the later offset first looked fine against real
-// files and was wrong: in a record using the *earlier* layout, offset 0x2C lands on
-// the second timestamp of the array, which is a perfectly plausible instant — so the
-// later candidate validated and every run time came out shifted by one slot. Reading
-// the earlier offset first inverts that safely, because in the later layout 0x24
-// holds two small unknown dwords (14 and 2 on every one of 250 real files) which
-// cannot be mistaken for a FILETIME.
+// Candidates stay **ordered by ascending offset** — lastRunOffset, then
+// runCountOffset — because that is the order the heuristic fallback needs. Trying a
+// later offset first looked fine against real files and was wrong: a candidate that
+// lands in the middle of an array reads a perfectly plausible instant and shifts
+// every run time by a slot.
 var layouts = map[uint32][]layout{
-	17: {{name: "17", lastRunOffset: 0x24, lastRunSlots: 1, runCountOffset: 0x3C, volumeStride: 40}},
-	23: {{name: "23", lastRunOffset: 0x24, lastRunSlots: 1, runCountOffset: 0x3C, volumeStride: 96}},
-	26: {{name: "26", lastRunOffset: 0x24, lastRunSlots: 8, runCountOffset: 0x74, volumeStride: 96}},
+	17: {{name: "17", infoSize: 68, lastRunOffset: 36, lastRunSlots: 1, runCountOffset: 60, volumeStride: 40}},
+	// Offset 36 became 8 bytes of padding in version 23 and has stayed that way
+	// since, which is why every later layout starts its array at 44.
+	23: {{name: "23", infoSize: 156, lastRunOffset: 44, lastRunSlots: 1, runCountOffset: 68, volumeStride: 104}},
+	26: {{name: "26", infoSize: 220, lastRunOffset: 44, lastRunSlots: 8, runCountOffset: 124, volumeStride: 104}},
 	30: {
-		{name: "30", lastRunOffset: 0x24, lastRunSlots: 8, runCountOffset: 0x74, volumeStride: 96},
-		{name: "30v2", lastRunOffset: 0x2C, lastRunSlots: 8, runCountOffset: 0x74, volumeStride: 96},
+		{name: "30v2", infoSize: 212, lastRunOffset: 44, lastRunSlots: 8, runCountOffset: 116, volumeStride: 96},
+		{name: "30v1", infoSize: 220, lastRunOffset: 44, lastRunSlots: 8, runCountOffset: 124, volumeStride: 96},
 	},
-	31: {
-		{name: "31", lastRunOffset: 0x24, lastRunSlots: 8, runCountOffset: 0x74, volumeStride: 96},
-		{name: "31v2", lastRunOffset: 0x2C, lastRunSlots: 8, runCountOffset: 0x74, volumeStride: 96},
-	},
+	31: {{name: "31v2", infoSize: 212, lastRunOffset: 44, lastRunSlots: 8, runCountOffset: 116, volumeStride: 96}},
 }
+
+// layoutSearchOrder is the version order the shape-matching and unknown-version
+// fallbacks walk: newest first, because a new Windows build is far more likely to
+// reuse a recent block layout than an ancient one.
+var layoutSearchOrder = []uint32{31, 30, 26, 23, 17}
 
 const (
 	// headerSize is the fixed part every version shares: version, signature, an
@@ -208,32 +222,31 @@ func (f *File) SetNameHash(fileName string) {
 	}
 }
 
-// chooseLayout picks the field layout that reads as valid data.
+// chooseLayout picks the field layout for a record, then checks that it reads as
+// valid data before returning it.
 //
-// Two checks decide it, and both come from measuring real files rather than from the
-// published tables:
+// The record states its own shape. Dword 0 of the file information block is the file
+// metrics array offset, and because the block is fixed-size per variant, subtracting
+// the header gives the block size — 212 on all 682 real v30/v31 records measured, 220
+// for the other published variant. So selection is a lookup on a declared value
+// first, and only a record whose declared size matches nothing falls back to guessing
+// from the data. That order matters: the two version-30 variants differ *only* in
+// where the run count sits, and the dword at the wrong one of those two offsets reads
+// as a plausible run count in 143 of those 682 records.
+//
+// Validation still runs on the selected candidate, because dword 0 comes out of the
+// file like everything else and a .pf is an artifact an intruder can write. Two
+// checks, both from measuring real files rather than from the published tables:
 //
 //   - The first run-time slot has to be a plausible instant, and the slot *before*
-//     it must not be. Together those separate version 30's two layouts: the first
-//     check alone accepts a candidate that has landed in the middle of the array,
-//     which silently shifts every timestamp by one position.
+//     it must not be. The second half is what rejects a candidate that has landed in
+//     the middle of the array, which silently shifts every timestamp by one position.
 //   - The run count has to be at least the number of populated timestamp slots. A
 //     program cannot have run fewer times than it has recorded runs. Across 250 real
 //     files the correct offset violated this zero times while the neighbouring dword
 //     violated it 136 times, so the check discriminates rather than merely passing.
 func chooseLayout(body []byte, version uint32) (layout, bool) {
-	candidates := layouts[version]
-	if len(candidates) == 0 {
-		// An unrecognised version is still worth attempting: the header is fixed and
-		// a new Windows build is far more likely to reuse a known block layout than
-		// to invent one. Ordered newest-first so a future version tries the modern
-		// shape before the ancient one.
-		for _, v := range []uint32{31, 30, 26, 23, 17} {
-			candidates = append(candidates, layouts[v]...)
-		}
-	}
-
-	for _, candidate := range candidates {
+	for _, candidate := range orderCandidates(body, version) {
 		if !fits(body, fileInfoOffset+candidate.lastRunOffset, candidate.lastRunSlots*8) ||
 			!fits(body, fileInfoOffset+candidate.runCountOffset, 4) {
 			continue
@@ -245,7 +258,7 @@ func chooseLayout(body []byte, version uint32) (layout, bool) {
 		// Reject a candidate that has landed inside an array starting earlier. Only
 		// checked past the fixed nine-dword block, whose contents are offsets and
 		// counts rather than timestamps.
-		if prev := candidate.lastRunOffset - 8; prev >= 0x24 {
+		if prev := candidate.lastRunOffset - 8; prev >= 36 {
 			if v := le64(body, fileInfoOffset+prev); v >= filetimeMin && v <= filetimeMax {
 				continue
 			}
@@ -262,6 +275,47 @@ func chooseLayout(body []byte, version uint32) (layout, bool) {
 		return candidate, true
 	}
 	return layout{}, false
+}
+
+// orderCandidates puts the layouts for a record in the order they should be tried:
+// the shape the record declares, then the same shape under a different version
+// number, then everything else.
+//
+// The middle group is the one worth explaining. A version number Tyto has never seen,
+// or a version that has grown a second variant since this table was written, still
+// declares a block size — and a shape is a shape whoever wrote it. Reusing a known
+// layout that agrees with the declared size is a far better guess than reading a
+// version's only candidate at offsets the record has just contradicted.
+func orderCandidates(body []byte, version uint32) []layout {
+	known := layouts[version]
+	declared := int(le32(body, fileInfoOffset)) - fileInfoOffset
+
+	ordered := make([]layout, 0, len(known)+1)
+	seen := map[string]bool{}
+	add := func(pool []layout, wantDeclaredSize bool) {
+		for _, candidate := range pool {
+			if (candidate.infoSize == declared) != wantDeclaredSize || seen[candidate.name] {
+				continue
+			}
+			seen[candidate.name] = true
+			ordered = append(ordered, candidate)
+		}
+	}
+
+	add(known, true)
+	for _, v := range layoutSearchOrder {
+		add(layouts[v], true)
+	}
+	add(known, false)
+	if len(known) == 0 {
+		// An unrecognised version whose declared size matches nothing either. The
+		// header is fixed, so the record is still worth attempting rather than
+		// discarding: fall through to validating every layout there is.
+		for _, v := range layoutSearchOrder {
+			add(layouts[v], false)
+		}
+	}
+	return ordered
 }
 
 func readRunTimes(body []byte, chosen layout) []time.Time {
