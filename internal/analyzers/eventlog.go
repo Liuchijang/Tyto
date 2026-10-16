@@ -44,18 +44,34 @@ func (c *eventLogParser) Analyze(ctx context.Context, req module.AnalyzeRequest)
 		return module.AnalyzeResult{OutputPath: outDir, Error: fmt.Sprintf("no selected or available EVTX files found in %s", sourceDir)}
 	}
 
+	// The C# helper prefixes every path with \\?\, which only means anything on an
+	// absolute one — a relative --input or -o would otherwise reach it as is.
+	if sourceDir, err = filepath.Abs(sourceDir); err != nil {
+		return analyzerError(outDir, fmt.Errorf("resolve EVTX source dir: %w", err))
+	}
+	csvDir, err := filepath.Abs(outDir)
+	if err != nil {
+		return analyzerError(outDir, fmt.Errorf("resolve eventlog parser output dir: %w", err))
+	}
+
 	// Staged under the analyzer's own output directory rather than %TEMP%, for the
 	// same reason stageLiveAmcacheHive is: %TEMP% is on the volume being investigated,
 	// and a run killed mid-parse would leave copies of the subject's event logs there.
 	// Here they sit inside the run and are removed before it finishes.
-	stageDir := filepath.Join(outDir, "_staging")
+	stageDir := filepath.Join(csvDir, "_staging")
 	if err := os.MkdirAll(stageDir, 0o755); err != nil {
 		return analyzerError(outDir, fmt.Errorf("create eventlog staging dir: %w", err))
 	}
 
-	quotedFiles := make([]string, 0, len(selectedFiles))
-	for _, file := range selectedFiles {
-		quotedFiles = append(quotedFiles, utils.PSQuote(file))
+	// The file list goes to the script through a file, not inline. The script travels
+	// on powershell.exe's command line, which Windows caps at 32,767 characters, and
+	// inlined it grew with the run: 386 log names were 21,589 of the ~30,000
+	// characters on a real run, so a host with a few more channels failed the whole
+	// analyzer with "The filename or extension is too long".
+	listFile := filepath.Join(stageDir, "files.txt")
+	outCsv := filepath.Join(csvDir, "eventlog_records.csv")
+	if err := os.WriteFile(listFile, []byte(strings.Join(selectedFiles, "\n")), 0o644); err != nil {
+		return analyzerError(outDir, fmt.Errorf("write eventlog file list: %w", err))
 	}
 
 	// The per-event work runs in a compiled helper rather than in PowerShell: a
@@ -85,19 +101,71 @@ $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 $sourceDir = ` + utils.PSQuote(sourceDir) + `
 $stageDir = ` + utils.PSQuote(stageDir) + `
-$outCsv = Join-Path ` + utils.PSQuote(outDir) + ` 'eventlog_records.csv'
-$selectedFiles = [string[]]@(` + strings.Join(quotedFiles, ",\n") + `)
-if (Test-Path $outCsv) { Remove-Item -LiteralPath $outCsv -Force }
+$outCsv = ` + utils.PSQuote(outCsv) + `
+$listFile = ` + utils.PSQuote(listFile) + `
 
-Add-Type -ReferencedAssemblies 'System.Core' -TypeDefinition @'
+Add-Type -ReferencedAssemblies 'System.Core','System.Xml','System.Xml.Linq' -TypeDefinition @'
 using System;
 using System.Diagnostics.Eventing.Reader;
 using System.Globalization;
+using System.ComponentModel;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Xml;
+using System.Xml.Linq;
+using Microsoft.Win32.SafeHandles;
 
 public static class FirEvtx
 {
+    // Every file this helper touches goes through Win32 with an extended-length
+    // path, never through System.IO's path APIs. powershell.exe runs .NET Framework
+    // with legacy path handling, which enforces MAX_PATH on every path and rejects
+    // the \\?\ prefix too — measured, a StreamWriter on a prefixed path throws
+    // PathTooLongException. So with -o 197 characters deep the CSV path itself
+    // passed 260 and the analyzer failed outright. A CreateFileW handle wrapped in
+    // a FileStream, CopyFileW and EvtQuery all accept the prefix: measured, a
+    // 353-character staged copy was copied and read in full.
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CopyFileW(string source, string target, bool failIfExists);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool DeleteFileW(string name);
+
+    const uint GenericRead = 0x80000000, GenericWrite = 0x40000000, ShareRead = 1;
+    const uint CreateAlways = 2, OpenExisting = 3, FileAttributeNormal = 0x80;
+    const int ErrorFileNotFound = 2, ErrorPathNotFound = 3;
+
+    // Long prefixes a path Go has already made absolute and clean.
+    static string Long(string path)
+    {
+        if (path.StartsWith(@"\\?\")) return path;
+        if (path.StartsWith(@"\\")) return @"\\?\UNC\" + path.Substring(2);
+        return @"\\?\" + path;
+    }
+
+    static string Join(string dir, string name)
+    {
+        return dir.TrimEnd('\\') + "\\" + name;
+    }
+
+    static FileStream Open(string path, bool write)
+    {
+        var handle = CreateFileW(Long(path), write ? GenericWrite : GenericRead, ShareRead, IntPtr.Zero,
+            write ? CreateAlways : OpenExisting, FileAttributeNormal, IntPtr.Zero);
+        if (handle.IsInvalid) throw new IOException(path + ": " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
+        return new FileStream(handle, write ? FileAccess.Write : FileAccess.Read);
+    }
+
+    public static string[] ReadList(string path)
+    {
+        using (var r = new StreamReader(Open(path, false), Encoding.UTF8))
+        {
+            return r.ReadToEnd().Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+    }
+
     static readonly string[] LevelNames = { "LogAlways", "Critical", "Error", "Warning", "Information", "Verbose" };
 
     static void Field(StringBuilder sb, string value, bool last)
@@ -148,7 +216,7 @@ public static class FirEvtx
     public static long Export(string sourceDir, string outCsv, string[] files, string stageDir)
     {
         long rows = 0;
-        using (var w = new StreamWriter(outCsv, false, new UTF8Encoding(true)))
+        using (var w = new StreamWriter(Open(outCsv, true), new UTF8Encoding(true)))
         {
             w.NewLine = "\r\n";
 
@@ -156,31 +224,34 @@ public static class FirEvtx
             for (int i = 0; i < files.Length; i++)
             {
                 var fileName = files[i];
-                var source = Path.Combine(sourceDir, fileName);
-                if (!File.Exists(source)) continue;
+                var source = Join(sourceDir, fileName);
 
                 // The staged copy is numbered, not named after its log, and that is
                 // the difference between parsing a run's event logs and skipping
                 // them. Channel names run to 90 characters
                 // ("Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider%4Operational.evtx"),
-                // and .NET Framework's File.Copy still enforces MAX_PATH — so on a
-                // run whose -o happened to sit 60 characters deeper, 11 of this
-                // machine's logs failed to stage and went unread, while the same
-                // input analyzed from a shorter output directory read all of them.
-                // Nothing downstream sees this name: SourceFile in the CSV is
+                // and while the copy went through File.Copy, which enforces
+                // MAX_PATH, a run whose -o sat 60 characters deeper left 11 of this
+                // machine's logs unstaged and unread. CopyFileW has since lifted
+                // the limit; the short name still keeps the staged path well inside
+                // it. Nothing downstream sees this name: SourceFile in the CSV is
                 // written from fileName above.
-                var path = Path.Combine(stageDir, i.ToString(CultureInfo.InvariantCulture) + ".evtx");
-                try { File.Copy(source, path, true); }
-                catch (Exception ex)
+                //
+                // A log that is not there is skipped silently, as the File.Exists
+                // check this replaced did; any other failure is named.
+                var path = Join(stageDir, i.ToString(CultureInfo.InvariantCulture) + ".evtx");
+                if (!CopyFileW(Long(source), Long(path), false))
                 {
-                    Console.WriteLine("TYTO-STAGE-FAILED\t" + fileName + "\t" + ex.Message.Replace('\t', ' '));
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == ErrorFileNotFound || err == ErrorPathNotFound) continue;
+                    Console.WriteLine("TYTO-STAGE-FAILED\t" + fileName + "\t" + new Win32Exception(err).Message.Replace('\t', ' '));
                     continue;
                 }
 
                 EventLogReader reader;
                 try
                 {
-                    var query = new EventLogQuery(path, PathType.FilePath);
+                    var query = new EventLogQuery(Long(path), PathType.FilePath);
                     query.ReverseDirection = false;
                     reader = new EventLogReader(query);
                 }
@@ -221,17 +292,7 @@ public static class FirEvtx
                                 Field(sb, Num(rec.ThreadId), false);
                                 Field(sb, rec.MachineName, false);
                                 Field(sb, rec.UserId != null ? rec.UserId.ToString() : null, false);
-                                // Message, deliberately empty on every row. It would
-                                // come from rec.FormatDescription(), which is the same
-                                // per-event message-table lookup LevelDisplayName is
-                                // refused for above — and worse for evidence: it
-                                // resolves against the providers installed on the
-                                // machine doing the parsing, so an offline analysis
-                                // would render different text from a live one for the
-                                // identical event. The column stays so the CSV's shape
-                                // does not depend on the decision; what the event says
-                                // is in the .evtx the run still holds.
-                                Field(sb, "", true);
+                                Field(sb, Payload(rec), true);
                                 w.WriteLine(sb.ToString());
                                 rows++;
                             }
@@ -247,17 +308,107 @@ public static class FirEvtx
         return rows;
     }
 
+    // Payload renders the event's own EventData or UserData as Name=Value pairs
+    // joined by " | ", and that is what the Message column carries.
+    //
+    // It is not rec.FormatDescription(), the sentence Event Viewer shows. That text
+    // is resolved per event from the provider's message-table resources — the same
+    // lookup LevelDisplayName is refused for above — and against the providers
+    // installed on the machine doing the parsing, so an offline analysis would
+    // render different text, or none, for the identical event. ToXml() renders only
+    // what the record itself stores, so live and offline output are the same. The
+    // sentence is a template over exactly these fields.
+    //
+    // Classic events carry unnamed <Data> elements; they are numbered by position.
+    //
+    // EvtRender passes control characters a provider logged straight into the XML,
+    // which XML 1.0 forbids: measured, 3 of 361,508 events on a real run (0x14 in
+    // Host-Network-Service 1024) were otherwise unreadable. They are escaped to
+    // character references, which CheckCharacters = false accepts, so the value is
+    // kept as logged. Whitespace-only values ("ExtraInfo" = "\n") are kept too;
+    // XElement.Parse would drop them.
+    static readonly XmlReaderSettings LenientXml = new XmlReaderSettings { CheckCharacters = false };
+
+    static string EscapeControlChars(string xml)
+    {
+        StringBuilder sb = null;
+        for (int i = 0; i < xml.Length; i++)
+        {
+            char c = xml[i];
+            if (c < 0x20 && c != '\t' && c != '\n' && c != '\r')
+            {
+                if (sb == null) sb = new StringBuilder(xml, 0, i, xml.Length + 16);
+                sb.Append("&#x").Append(((int)c).ToString("X", CultureInfo.InvariantCulture)).Append(';');
+            }
+            else if (sb != null) sb.Append(c);
+        }
+        return sb == null ? xml : sb.ToString();
+    }
+
+    static string Payload(EventRecord rec)
+    {
+        XElement root;
+        try
+        {
+            using (var r = XmlReader.Create(new StringReader(EscapeControlChars(rec.ToXml())), LenientXml))
+                root = XElement.Load(r);
+        }
+        catch (Exception ex) { return "(event data unreadable: " + ex.Message + ")"; }
+
+        var sb = new StringBuilder();
+        foreach (var section in root.Elements())
+        {
+            var name = section.Name.LocalName;
+            if (name == "EventData")
+            {
+                int index = 0;
+                foreach (var e in section.Elements())
+                {
+                    string key = e.Name.LocalName;
+                    if (key == "Data")
+                    {
+                        var attr = e.Attribute("Name");
+                        key = attr != null && attr.Value.Length > 0
+                            ? attr.Value
+                            : "Data[" + index.ToString(CultureInfo.InvariantCulture) + "]";
+                    }
+                    Pair(sb, key, e.Value);
+                    index++;
+                }
+            }
+            else if (name == "UserData")
+            {
+                // UserData is one provider-defined element whose leaves are the fields.
+                foreach (var e in section.Descendants())
+                {
+                    if (!e.HasElements && e.Parent != section) Pair(sb, e.Name.LocalName, e.Value);
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    static void Pair(StringBuilder sb, string key, string value)
+    {
+        if (sb.Length > 0) sb.Append(" | ");
+        sb.Append(key).Append('=').Append(value);
+    }
+
     static void TryDelete(string path)
     {
-        try { File.Delete(path); } catch { }
+        DeleteFileW(Long(path));
     }
 }
 '@
 
-[FirEvtx]::Export($sourceDir, $outCsv, $selectedFiles, $stageDir) | Out-Null
-
-if (-not (Test-Path $outCsv)) {
-    throw 'no selected EVTX records could be parsed'
+# Test-Path is held to MAX_PATH as well, so success is the helper returning rather
+# than the CSV being visible to PowerShell. SilentlyContinue does not reach inside
+# try, so a helper that failed to compile or threw still fails the script.
+try {
+    [FirEvtx]::Export($sourceDir, $outCsv, [FirEvtx]::ReadList($listFile), $stageDir) | Out-Null
+} catch {
+    Write-Output ('no selected EVTX records could be parsed: ' + $_.Exception.Message)
+    exit 1
 }
 `
 
