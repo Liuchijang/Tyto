@@ -132,6 +132,9 @@ func hasInteractiveConsoleHandles() bool {
 }
 
 func isUsableStdHandle(kind uint32) bool {
+	if substituted[kind] {
+		return false
+	}
 	handle, err := windows.GetStdHandle(kind)
 	if err != nil || handle == 0 || handle == windows.InvalidHandle {
 		return false
